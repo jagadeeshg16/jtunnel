@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+relay — the server side of jtunnel.
+
+Three ways to run this:
+
+  A) On Render/Railway (free, no credit card):
+       - Deploy via Docker (see Dockerfile)
+       - Set TOKEN env variable in dashboard
+       - No SSL certs needed, platform handles it
+
+  B) On your own VPS/EC2 — with Nginx (recommended):
+       python3 relay --setup --nginx               ← self-signed cert
+       python3 relay --setup --nginx --domain x.com ← Let's Encrypt cert
+
+  C) On your own VPS/EC2 — without Nginx (relay handles SSL):
+       python3 relay --setup
+
+Install:  pip3 install aiohttp
+"""
+
+import asyncio, json, base64, uuid, ssl, sys, os, argparse, secrets, subprocess, re, time, shutil
+from aiohttp import web, WSMsgType
+
+_SAFE_ID = re.compile(r'^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$')
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+CONFIG_FILE = os.path.expanduser("~/.relayrc")
+
+def load_config():
+    cfg = {'token': None, 'port': '443', 'cert': 'cert.pem', 'key': 'key.pem', 'domain': None}
+    if os.path.exists(CONFIG_FILE):
+        for line in open(CONFIG_FILE):
+            if '=' in line and not line.startswith('#'):
+                k, _, v = line.partition('=')
+                key, val = k.strip(), v.strip()
+                cfg[key] = None if val in ('None', '', 'null') else val
+    # Environment variables override file (used in cloud deployments)
+    if os.environ.get('TOKEN'):  cfg['token']  = os.environ['TOKEN']
+    if os.environ.get('PORT'):   cfg['port']   = os.environ['PORT']
+    if os.environ.get('DOMAIN'): cfg['domain'] = os.environ['DOMAIN']
+    return cfg
+
+def save_config(cfg):
+    with open(CONFIG_FILE, 'w') as f:
+        for k, v in cfg.items():
+            if v is not None:  # skip None values
+                f.write(f"{k} = {v}\n")
+    os.chmod(CONFIG_FILE, 0o600)
+
+# ── VPS first-time setup ──────────────────────────────────────────────────────
+
+def do_setup(token_override=None, use_nginx=False, domain=None):
+    print("\n━━━ JTunnel VPS Setup ━━━\n")
+    cfg = load_config()
+
+    cfg['token'] = token_override or cfg.get('token') or secrets.token_urlsafe(24)
+    print(f"  Token: {cfg['token']}")
+    print(f"  (copy this — paste it when `jtunnel` asks)\n")
+
+    ip = subprocess.getoutput("curl -s --max-time 5 ifconfig.me || echo YOUR_VPS_IP")
+
+    if use_nginx:
+        _setup_nginx(cfg, domain, ip)
+    else:
+        _setup_direct_ssl(cfg, ip)
+
+    save_config(cfg)
+
+    # systemd service for relay
+    python  = sys.executable
+    script  = os.path.abspath(__file__)
+    workdir = os.path.dirname(script)
+    relay_port = cfg.get('port', '8080' if use_nginx else '443')
+    cloud_flag = '--cloud' if use_nginx else ''
+    svc = f"""[Unit]
+Description=JTunnel Relay
+After=network.target
+[Service]
+ExecStart={python} {script} {cloud_flag}
+WorkingDirectory={workdir}
+Restart=always
+RestartSec=5
+Environment=TOKEN={cfg['token']}
+Environment=PORT={relay_port}
+User=root
+[Install]
+WantedBy=multi-user.target
+"""
+    with open('/etc/systemd/system/jtunnel-relay.service', 'w') as f:
+        f.write(svc)
+    os.system("systemctl daemon-reload && systemctl enable jtunnel-relay && systemctl restart jtunnel-relay")
+
+    public = f"https://{domain}" if domain else f"https://{ip}"
+    print(f"""━━━ Done! ━━━
+
+  On your laptop:
+    jtunnel 3000 --vps {domain or ip} --token {cfg['token']}
+
+  Public URL: {public}
+""")
+
+
+def _setup_direct_ssl(cfg, ip):
+    """Relay handles SSL directly on port 443."""
+    cert, key = cfg.get('cert', 'cert.pem'), cfg.get('key', 'key.pem')
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        print("  Generating self-signed SSL certificate...")
+        subprocess.run(['openssl','req','-x509','-newkey','rsa:4096',
+            '-keyout',key,'-out',cert,'-days','365','-nodes',
+            '-subj',f'/CN={ip}'], check=True, capture_output=True)
+        os.chmod(key, 0o600)
+        print(f"  SSL cert generated.\n")
+    cfg['port'] = '443'
+    os.system("iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || "
+              "iptables -I INPUT -p tcp --dport 443 -j ACCEPT")
+
+
+def _setup_nginx(cfg, domain, ip):
+    """Install Nginx, generate wildcard self-signed cert, configure reverse proxy to relay on :8080."""
+    print("  Installing Nginx + certbot...")
+    subprocess.run(['apt-get','update','-qq'], check=True)
+    subprocess.run(['apt-get','install','-y','-qq','nginx','certbot'], check=True)
+    os.makedirs('/var/www/html', exist_ok=True)
+
+    cfg['port'] = '8080'  # relay listens on 8080, nginx proxies from 443
+    if domain:
+        cfg['domain'] = domain
+
+    cert, key = '/etc/nginx/jtunnel.crt', '/etc/nginx/jtunnel.key'
+
+    if domain:
+        server_name = domain
+        cn          = f'*.{domain}'
+        san         = f'DNS:{domain},DNS:*.{domain}'
+        print(f"  Generating wildcard self-signed cert for *.{domain}...")
+    else:
+        server_name = ip
+        cn          = ip
+        san         = f'IP:{ip}'
+        print(f"  Generating self-signed cert for {ip}...")
+
+    subprocess.run([
+        'openssl','req','-x509','-newkey','rsa:4096',
+        '-keyout', key, '-out', cert, '-days', '365', '-nodes',
+        '-subj', f'/CN={cn}',
+        '-addext', f'subjectAltName={san}',
+    ], check=True, capture_output=True)
+    os.chmod(key, 0o600)
+    print(f"  Cert generated.\n")
+
+    ssl_block = f"""
+    ssl_certificate     {cert};
+    ssl_certificate_key {key};"""
+
+    # Wildcard subdomain if domain provided, exact match otherwise
+    wildcard = f"*.{server_name} {server_name}" if domain else server_name
+
+    nginx_conf = f"""server {{
+    listen 80;
+    server_name {wildcard};
+    location /.well-known/acme-challenge/ {{
+        root /var/www/html;
+    }}
+    location / {{
+        return 301 https://$host$request_uri;
+    }}
+}}
+
+server {{
+    listen 443 ssl;
+    server_name {wildcard};
+{ssl_block}
+
+    # Use subdomain if present, else fall back to what the client sent
+    set $tunnel_name $http_x_tunnel_name;
+    if ($host ~* "^(.+)\\.{server_name}$") {{
+        set $tunnel_name $1;
+    }}
+
+    location /.well-known/acme-challenge/ {{
+        root /var/www/html;
+    }}
+
+    location / {{
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Tunnel-Name $tunnel_name;
+        proxy_read_timeout 3600s;
+    }}
+}}
+"""
+    with open('/etc/nginx/sites-available/jtunnel', 'w') as f:
+        f.write(nginx_conf)
+
+    # Long subdomain names exceed nginx's default 64-byte server_names_hash_bucket_size
+    with open('/etc/nginx/conf.d/jtunnel.conf', 'w') as f:
+        f.write("server_names_hash_bucket_size 128;\n")
+
+    os.system("ln -sf /etc/nginx/sites-available/jtunnel /etc/nginx/sites-enabled/jtunnel")
+    os.system("rm -f /etc/nginx/sites-enabled/default")
+    os.system("nginx -t && systemctl enable nginx && systemctl restart nginx")
+
+    if domain:
+        # Get a real cert for the base domain via HTTP-01
+        print(f"  Requesting Let's Encrypt cert for {domain}...")
+        ret = os.system(
+            f"certbot certonly --webroot -w /var/www/html -d {domain} "
+            f"--non-interactive --agree-tos -m admin@{domain} --quiet"
+        )
+        if ret == 0:
+            # Swap self-signed cert for real one in the nginx conf
+            real_cert = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
+            real_key  = f"/etc/letsencrypt/live/{domain}/privkey.pem"
+            conf_path = '/etc/nginx/sites-available/jtunnel'
+            with open(conf_path) as f:
+                conf = f.read()
+            conf = conf.replace('/etc/nginx/jtunnel.crt', real_cert)
+            conf = conf.replace('/etc/nginx/jtunnel.key', real_key)
+            with open(conf_path, 'w') as f:
+                f.write(conf)
+            os.system("nginx -s reload")
+            print(f"  Base domain cert installed — {domain} is now trusted.\n")
+        else:
+            print(f"  Base domain cert failed — using self-signed as fallback.\n")
+
+    os.system("iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || "
+              "iptables -I INPUT -p tcp --dport 443 -j ACCEPT")
+    os.system("iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || "
+              "iptables -I INPUT -p tcp --dport 80 -j ACCEPT")
+
+    print("  Nginx configured and running.\n")
+
+# ── per-tunnel cert issuance ──────────────────────────────────────────────────
+
+def _write_tunnel_nginx_conf(tunnel_id, domain):
+    fqdn = f'{tunnel_id}.{domain}'
+    cert = f'/etc/letsencrypt/live/{fqdn}/fullchain.pem'
+    key  = f'/etc/letsencrypt/live/{fqdn}/privkey.pem'
+    conf = f"""server {{
+    listen 443 ssl;
+    server_name {fqdn};
+    ssl_certificate     {cert};
+    ssl_certificate_key {key};
+
+    location / {{
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Tunnel-Name {tunnel_id};
+        proxy_read_timeout 3600s;
+    }}
+}}
+"""
+    path = f'/etc/nginx/sites-available/jtunnel-{tunnel_id}'
+    with open(path, 'w') as f:
+        f.write(conf)
+    os.system(f'ln -sf {path} /etc/nginx/sites-enabled/jtunnel-{tunnel_id}')
+    os.system('nginx -s reload 2>/dev/null')
+
+
+async def _issue_cert(tunnel_id, domain):
+    fqdn      = f'{tunnel_id}.{domain}'
+    cert_path = f'/etc/letsencrypt/live/{fqdn}/fullchain.pem'
+
+    if os.path.exists(cert_path):
+        _write_tunnel_nginx_conf(tunnel_id, domain)
+        return
+
+    print(f'[*] Issuing Let\'s Encrypt cert for {fqdn}...')
+    proc = await asyncio.create_subprocess_exec(
+        'certbot', 'certonly',
+        '--webroot', '-w', '/var/www/html',
+        '-d', fqdn,
+        '--non-interactive', '--agree-tos',
+        '-m', f'admin@{domain}',
+        '--quiet',
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode == 0:
+        _write_tunnel_nginx_conf(tunnel_id, domain)
+        print(f'[+] Cert issued for {fqdn} — no more browser warning')
+    else:
+        print(f'[!] Cert failed for {fqdn} (tunnel still works with self-signed):')
+        print(f'    {stderr.decode().strip()[:200]}')
+
+
+_CERT_META_FILE = os.path.expanduser('~/.jtunnel-certs.json')
+_TTL_NAMED  = 7 * 86400   # 1 week  for named tunnels
+_TTL_RANDOM =     86400   # 1 day   for random tunnels
+
+def _load_meta():
+    try:
+        with open(_CERT_META_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_meta(meta):
+    with open(_CERT_META_FILE, 'w') as f:
+        json.dump(meta, f)
+
+
+def _delete_cert(tunnel_id, domain):
+    fqdn = f'{tunnel_id}.{domain}'
+    for path in (
+        f'/etc/letsencrypt/live/{fqdn}',
+        f'/etc/letsencrypt/archive/{fqdn}',
+        f'/etc/letsencrypt/renewal/{fqdn}.conf',
+    ):
+        if os.path.isdir(path):  shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path): os.remove(path)
+
+
+def _cleanup_tunnel(tunnel_id, domain, named):
+    """Remove nginx conf on disconnect; record disconnect time for deferred cert cleanup."""
+    if not domain:
+        return
+
+    # Remove nginx routing immediately
+    removed = False
+    for path in (f'/etc/nginx/sites-enabled/jtunnel-{tunnel_id}',
+                 f'/etc/nginx/sites-available/jtunnel-{tunnel_id}'):
+        if os.path.exists(path):
+            os.remove(path)
+            removed = True
+    if removed:
+        os.system('nginx -s reload 2>/dev/null')
+
+    # Record disconnect time so background task can expire cert later
+    meta = _load_meta()
+    meta[tunnel_id] = {'named': named, 'disconnected_at': time.time()}
+    _save_meta(meta)
+    print(f'[x] Tunnel removed: {tunnel_id}')
+
+
+async def _cert_cleanup_loop(cfg):
+    """Hourly: delete certs for tunnels idle > 1 day (random) or > 7 days (named)."""
+    while True:
+        await asyncio.sleep(3600)
+        domain = cfg.get('domain')
+        if not domain:
+            continue
+        meta    = _load_meta()
+        now     = time.time()
+        expired = [tid for tid, info in meta.items()
+                   if now - info.get('disconnected_at', 0) >
+                      (_TTL_NAMED if info.get('named') else _TTL_RANDOM)]
+        for tid in expired:
+            _delete_cert(tid, domain)
+            del meta[tid]
+            print(f'[x] Expired cert cleaned: {tid}')
+        if expired:
+            _save_meta(meta)
+
+
+# ── relay core ────────────────────────────────────────────────────────────────
+
+_tunnels = {}   # {tunnel_id: websocket}
+_pending = {}   # {req_id: future}
+_HOP = {'connection','keep-alive','te','trailers','transfer-encoding',
+        'upgrade','host','content-length','proxy-authenticate','proxy-authorization'}
+
+async def tunnel_endpoint(request):
+    cfg       = request.app['cfg']
+    if request.headers.get('X-Token') != cfg['token']:
+        return web.Response(status=401, text="Bad token\n")
+
+    tunnel_id = request.headers.get('X-Tunnel-Name', 'default')
+    named     = request.headers.get('X-Named') == '1'
+
+    # If tunnel already exists, kick the old connection — same ID means same client reconnecting
+    if tunnel_id in _tunnels and not _tunnels[tunnel_id].closed:
+        await _tunnels[tunnel_id].close()
+        _tunnels.pop(tunnel_id, None)
+        print(f"[~] Replaced existing tunnel: {tunnel_id}")
+
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+    _tunnels[tunnel_id] = ws
+    print(f"[+] jtunnel connected: {tunnel_id}  (active: {list(_tunnels)})")
+
+    # Send public URL back to client
+    domain = cfg.get('domain')
+    host   = request.headers.get('Host', '').split(':')[0]
+    public_url = f"https://{tunnel_id}.{domain}" if domain else f"https://{host}"
+    await ws.send_str(json.dumps({'type': 'welcome', 'url': public_url, 'tunnel_id': tunnel_id}))
+
+    # Issue a real cert for this tunnel in the background
+    if domain and _SAFE_ID.match(tunnel_id):
+        asyncio.create_task(_issue_cert(tunnel_id, domain))
+
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                fut  = _pending.get(data.get('id'))
+                if fut and not fut.done():
+                    fut.set_result(data)
+            elif msg.type == WSMsgType.ERROR:
+                break
+    finally:
+        _tunnels.pop(tunnel_id, None)
+        print(f"[-] jtunnel disconnected: {tunnel_id}  (active: {list(_tunnels)})")
+        _cleanup_tunnel(tunnel_id, domain, named)
+    return ws
+
+def _resolve_tunnel(request):
+    """Pick the right tunnel websocket for this request."""
+    cfg    = request.app['cfg']
+    domain = cfg.get('domain')
+
+    if domain:
+        # Self-hosted: extract subdomain from Host header
+        # e.g. Host: jagadeesh-app1.yourdomain.com → tunnel_id = jagadeesh-app1
+        host      = request.headers.get('Host', '')
+        subdomain = host.replace(f'.{domain}', '').rstrip('.')
+        return _tunnels.get(subdomain), subdomain
+    else:
+        # Cloud mode: single tunnel, use whichever is connected
+        if _tunnels:
+            tid = next(iter(_tunnels))
+            return _tunnels[tid], tid
+        return None, 'default'
+
+async def proxy(request):
+    ws, tunnel_id = _resolve_tunnel(request)
+    if not ws or ws.closed:
+        connected = list(_tunnels.keys())
+        return web.Response(status=503, content_type='text/html', text="""<!DOCTYPE html>
+<html>
+<head>
+  <title>jtunnel — not connected</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #e6edf3; display: flex;
+           align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .box { border: 1px solid #30363d; border-radius: 8px; padding: 2rem 2.5rem; max-width: 480px; }
+    h2 { margin: 0 0 1rem; color: #f85149; }
+    code { background: #161b22; padding: 2px 6px; border-radius: 4px; color: #79c0ff; }
+    .step { margin: 0.4rem 0; color: #8b949e; }
+    .step span { color: #e6edf3; }
+    a { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>⚡ jtunnel not connected</h2>
+    <p>The relay is running but no tunnel client is connected.</p>
+    <p>Run this on your laptop:</p>
+    <p><code>jtunnel 3000</code> &nbsp; or &nbsp; <code>jtunnel 7443 --https</code></p>
+    <hr style="border-color:#30363d; margin: 1.2rem 0">
+    <div class="step">Relay: <span style="color:#3fb950">● running</span></div>
+    <div class="step">Client: <span style="color:#f85149">✗ not connected</span></div>
+    <div class="step">Requests: <span>on hold until client connects</span></div>
+    <hr style="border-color:#30363d; margin: 1.2rem 0">
+    <div class="step">Health: <a href="/_health">/_health</a></div>
+  </div>
+</body>
+</html>""")
+
+    body   = await request.read()
+    req_id = str(uuid.uuid4())
+    fut    = asyncio.get_event_loop().create_future()
+    _pending[req_id] = fut
+
+    try:
+        await ws.send_str(json.dumps({
+            'id':      req_id,
+            'method':  request.method,
+            'path':    str(request.rel_url),
+            'headers': {k: v for k, v in request.headers.items() if k.lower() not in _HOP},
+            'body':    base64.b64encode(body).decode(),
+        }))
+        r = await asyncio.wait_for(fut, timeout=30)
+    except asyncio.TimeoutError:
+        _pending.pop(req_id, None)
+        return web.Response(status=504, text="Timeout\n")
+    except Exception as e:
+        _pending.pop(req_id, None)
+        return web.Response(status=502, text=str(e))
+    finally:
+        _pending.pop(req_id, None)
+
+    return web.Response(
+        status  = r.get('status', 502),
+        headers = {k: v for k, v in r.get('headers', {}).items() if k.lower() not in _HOP},
+        body    = base64.b64decode(r.get('body', '')),
+    )
+
+async def health(request):
+    active = [tid for tid, ws in _tunnels.items() if not ws.closed]
+    return web.json_response({
+        'relay':   'up',
+        'tunnels': active,
+        'count':   len(active),
+    })
+
+# ── start ─────────────────────────────────────────────────────────────────────
+
+async def start(cfg, cloud=False):
+    if not cfg.get('token'):
+        print("[!] TOKEN not set.")
+        print("    VPS:   run `python3 relay --setup`")
+        print("    Cloud: set TOKEN environment variable in Koyeb/Render dashboard")
+        sys.exit(1)
+
+    app = web.Application(client_max_size=50 * 1024 * 1024)
+    app['cfg'] = cfg
+    app.router.add_get ('/_jtunnel', tunnel_endpoint)
+    app.router.add_get ('/_health',  health)
+    app.router.add_route('*', '/',          proxy)
+    app.router.add_route('*', '/{path:.*}', proxy)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(cfg.get('port', 443))
+
+    if cloud:
+        # Cloud mode: plain HTTP, SSL terminated by Koyeb/Render
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        print(f"[+] JTunnel relay running (cloud mode) on port {port}")
+    else:
+        # VPS mode: HTTPS with SSL cert
+        cert, key = cfg.get('cert','cert.pem'), cfg.get('key','key.pem')
+        if not os.path.exists(cert):
+            print(f"[!] SSL cert not found. Run:  python3 relay --setup")
+            sys.exit(1)
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(cert, key)
+        site = web.TCPSite(runner, '0.0.0.0', port, ssl_context=ssl_ctx)
+        print(f"[+] JTunnel relay running (VPS mode) on port {port}")
+
+    await site.start()
+    asyncio.create_task(_cert_cleanup_loop(cfg))
+    print(f"[+] Waiting for jtunnel client...")
+    await asyncio.Event().wait()
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--setup',  action='store_true', help='First-time VPS setup')
+    ap.add_argument('--nginx',  action='store_true', help='Install Nginx as SSL reverse proxy')
+    ap.add_argument('--domain', help='Domain for Let\'s Encrypt cert (used with --nginx)')
+    ap.add_argument('--cloud',  action='store_true', help='Cloud mode (no SSL, reads PORT from env)')
+    ap.add_argument('--token',  help='Secret token')
+    args = ap.parse_args()
+
+    if args.setup:
+        do_setup(args.token, use_nginx=args.nginx, domain=args.domain)
+        return
+
+    cfg = load_config()
+    if args.token:
+        cfg['token'] = args.token
+
+    try:
+        asyncio.run(start(cfg, cloud=args.cloud))
+    except KeyboardInterrupt:
+        print('\n[*] JTunnel relay stopped.')
+
+if __name__ == '__main__':
+    main()
