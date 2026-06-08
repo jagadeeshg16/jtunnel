@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+jtunnel — runs on YOUR LAPTOP. That's the only command you need.
+
+Usage:
+  jtunnel 3000              # forward localhost:3000
+  jtunnel 3000 app1         # named tunnel → hostname-app1.yourdomain.com
+  jtunnel 7443 api --https  # named tunnel, local HTTPS server
+
+First run asks for your VPS IP + token and saves to ~/.jtunnelrc.
+After that: just `jtunnel <port>`.
+
+Install dep:  pip3 install aiohttp
+"""
+
+import asyncio, json, base64, ssl, sys, os, argparse, socket, random, string, aiohttp
+
+CONFIG_FILE = os.path.expanduser("~/.jtunnelrc")
+RECONNECT   = 5
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        for line in open(CONFIG_FILE):
+            line = line.strip()
+            if '=' in line and not line.startswith('#'):
+                k, _, v = line.partition('=')
+                cfg[k.strip()] = v.strip()
+    return cfg
+
+def save_config(cfg):
+    with open(CONFIG_FILE, 'w') as f:
+        f.write("# jtunnel config — edit anytime\n")
+        for k, v in cfg.items():
+            f.write(f"{k} = {v}\n")
+    os.chmod(CONFIG_FILE, 0o600)
+    print(f"  Saved to {CONFIG_FILE}\n")
+
+def get_config(args):
+    cfg = load_config()
+
+    vps   = args.vps   or cfg.get('vps')
+    token = args.token or cfg.get('token')
+
+    if not vps or not token:
+        print("First-time setup — answer once, saved forever.\n")
+        if not vps:
+            vps = input("  VPS IP or hostname: ").strip()
+        if not token:
+            token = input("  Token (from `relay --setup`): ").strip()
+
+    # Strip accidental https:// prefix and trailing slashes
+    vps = vps.removeprefix('https://').removeprefix('http://').strip('/')
+
+    cfg.update({'vps': vps, 'token': token})
+    if not os.path.exists(CONFIG_FILE) or args.vps or args.token:
+        save_config(cfg)
+
+    return vps, token
+
+def get_tunnel_id(name):
+    hostname = socket.gethostname().lower().replace(' ', '-').replace('_', '-')
+    suffix   = name or ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+    return f"{hostname}-{suffix}"
+
+# ── tunnel logic ──────────────────────────────────────────────────────────────
+
+_HOP = {'connection','keep-alive','te','trailers','transfer-encoding',
+        'upgrade','content-length','proxy-authenticate','proxy-authorization'}
+
+_local_ssl = ssl.create_default_context()
+_local_ssl.check_hostname = False
+_local_ssl.verify_mode    = ssl.CERT_NONE   # localhost cert is self-signed
+
+async def forward(session, local_url, msg):
+    is_https = local_url.startswith("https")
+    try:
+        async with session.request(
+            method          = msg['method'],
+            url             = local_url.rstrip('/') + msg['path'],
+            headers         = {k: v for k, v in msg.get('headers', {}).items()},
+            data            = base64.b64decode(msg.get('body', '')),
+            allow_redirects = False,
+            ssl             = _local_ssl if is_https else None,
+            timeout         = aiohttp.ClientTimeout(total=25),
+        ) as r:
+            return {
+                'id':      msg['id'],
+                'status':  r.status,
+                'headers': dict(r.headers),
+                'body':    base64.b64encode(await r.read()).decode(),
+            }
+    except aiohttp.ClientConnectorError:
+        err = f"Can't reach {local_url} — is your dev server running?"
+    except asyncio.TimeoutError:
+        err = "Local server timed out (25s)"
+    except Exception as e:
+        err = str(e)
+
+    print(f"  [!] {err}")
+    return {'id': msg['id'], 'status': 502, 'headers': {},
+            'body': base64.b64encode(err.encode()).decode()}
+
+async def run(vps, token, local_port, name=None, insecure=False, local_https=False):
+    relay_url    = f"wss://{vps}/_jtunnel"
+    scheme       = "https" if local_https else "http"
+    local_url    = f"{scheme}://localhost:{local_port}"
+    tunnel_id    = get_tunnel_id(name)
+    _token_tries = 0
+
+    if insecure:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode    = ssl.CERT_NONE
+    else:
+        ssl_ctx = True
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                print(f"[*] Connecting as '{tunnel_id}'...")
+                async with session.ws_connect(
+                    relay_url,
+                    headers   = {'X-Token': token, 'X-Tunnel-Name': tunnel_id,
+                                 'X-Named': '1' if name else '0'},
+                    ssl       = ssl_ctx,
+                    heartbeat = 20,
+                ) as ws:
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get('type') == 'welcome':
+                                print(f"[+] jtunnel live!")
+                                print(f"")
+                                print(f"    Tunnel  →  {data.get('tunnel_id', tunnel_id)}")
+                                print(f"    Local   →  {local_url}")
+                                print(f"    Public  →  {data.get('url')}")
+                                print(f"")
+                                print(f"    Ctrl+C to stop\n")
+                            else:
+                                asyncio.create_task(_handle(ws, session, local_url, data))
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+
+            except aiohttp.ClientConnectorError:
+                print(f"[!] Can't reach {vps}:443 — is relay running?")
+            except aiohttp.WSServerHandshakeError as e:
+                if '401' in str(e):
+                    if _token_tries >= 2:
+                        print(f"[!] Wrong token — giving up.")
+                        sys.exit(1)
+                    _token_tries += 1
+                    token = input(f"  Wrong token, try again ({_token_tries}/2): ").strip()
+                    cfg = load_config(); cfg['token'] = token; save_config(cfg)
+                    continue
+                if '409' in str(e):
+                    print(f"[!] '{tunnel_id}' is already registered — relay is cleaning up, retrying...")
+                print(f"[!] {e}")
+            except Exception as e:
+                print(f"[!] {e}")
+
+            print(f"[*] Reconnecting in {RECONNECT}s...")
+            await asyncio.sleep(RECONNECT)
+
+async def _handle(ws, session, local_url, data):
+    resp = await forward(session, local_url, data)
+    try:
+        await ws.send_str(json.dumps(resp))
+    except Exception:
+        pass
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(description='jtunnel — lightweight HTTPS tunnel')
+    ap.add_argument('port',    nargs='?', type=int, default=3000,
+                    help='Local port to forward (default: 3000)')
+    ap.add_argument('name',    nargs='?', default=None,
+                    help='Tunnel name (e.g. app1) → hostname-app1.yourdomain.com')
+    ap.add_argument('--vps',      help='VPS IP/hostname (saved after first use)')
+    ap.add_argument('--token',    help='Auth token (saved after first use)')
+    ap.add_argument('--insecure', action='store_true',
+                    help='Skip SSL verification (self-hosted VPS with self-signed cert)')
+    ap.add_argument('--https', action='store_true', dest='local_https',
+                    help='Local server uses HTTPS (e.g. localhost:7443)')
+    args = ap.parse_args()
+
+    vps, token = get_config(args)
+
+    try:
+        asyncio.run(run(vps, token, args.port,
+                        name=args.name,
+                        insecure=args.insecure,
+                        local_https=args.local_https))
+    except KeyboardInterrupt:
+        print('\n[*] Stopped.')
+
+if __name__ == '__main__':
+    main()
