@@ -163,6 +163,12 @@ curl https://jtunnel.yourdomain.com/_health
 
 ---
 
+## Learn more
+
+See [docs/architecture.md](docs/architecture.md) for a full technical walkthrough — request flow, SSL design, cert lifecycle, and multi-tunnel routing.
+
+---
+
 ## Config files
 
 | File | Location | Purpose |
