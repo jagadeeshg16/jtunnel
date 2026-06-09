@@ -10,8 +10,11 @@ Three ways to run this:
        - No SSL certs needed, platform handles it
 
   B) On your own VPS/EC2 — with Nginx (recommended):
-       python3 relay --setup --nginx               ← self-signed cert
-       python3 relay --setup --nginx --domain x.com ← Let's Encrypt cert
+       python3 relay --setup --nginx --domain x.com
+         ← HTTP-01: per-tunnel certs, no API needed
+
+       python3 relay --setup --nginx --domain x.com --gd-key KEY --gd-secret SECRET
+         ← DNS-01: one wildcard cert via GoDaddy API, covers all subdomains instantly
 
   C) On your own VPS/EC2 — without Nginx (relay handles SSL):
        python3 relay --setup
@@ -29,7 +32,7 @@ _SAFE_ID = re.compile(r'^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$')
 CONFIG_FILE = os.path.expanduser("~/.relayrc")
 
 def load_config():
-    cfg = {'token': None, 'port': '443', 'cert': 'cert.pem', 'key': 'key.pem', 'domain': None}
+    cfg = {'token': None, 'port': '443', 'cert': 'cert.pem', 'key': 'key.pem', 'domain': None, 'wildcard': None}
     if os.path.exists(CONFIG_FILE):
         for line in open(CONFIG_FILE):
             if '=' in line and not line.startswith('#'):
@@ -51,7 +54,7 @@ def save_config(cfg):
 
 # ── VPS first-time setup ──────────────────────────────────────────────────────
 
-def do_setup(token_override=None, use_nginx=False, domain=None):
+def do_setup(token_override=None, use_nginx=False, domain=None, gd_key=None, gd_secret=None):
     print("\n━━━ JTunnel VPS Setup ━━━\n")
     cfg = load_config()
 
@@ -62,7 +65,7 @@ def do_setup(token_override=None, use_nginx=False, domain=None):
     ip = subprocess.getoutput("curl -s --max-time 5 ifconfig.me || echo YOUR_VPS_IP")
 
     if use_nginx:
-        _setup_nginx(cfg, domain, ip)
+        _setup_nginx(cfg, domain, ip, gd_key=gd_key, gd_secret=gd_secret)
     else:
         _setup_direct_ssl(cfg, ip)
 
@@ -117,38 +120,67 @@ def _setup_direct_ssl(cfg, ip):
               "iptables -I INPUT -p tcp --dport 443 -j ACCEPT")
 
 
-def _setup_nginx(cfg, domain, ip):
-    """Install Nginx, generate wildcard self-signed cert, configure reverse proxy to relay on :8080."""
+def _setup_wildcard_cert(domain, gd_key, gd_secret):
+    """Get a wildcard Let's Encrypt cert via GoDaddy DNS-01 using acme.sh."""
+    acme = os.path.expanduser('~/.acme.sh/acme.sh')
+    if not os.path.exists(acme):
+        print("  Installing acme.sh...")
+        subprocess.run(
+            f'curl -fsSL https://get.acme.sh | sh -s email=admin@{domain}',
+            shell=True, check=True
+        )
+
+    print(f"  Requesting wildcard cert for *.{domain} via GoDaddy DNS API...")
+    env = {**os.environ, 'GD_Key': gd_key, 'GD_Secret': gd_secret}
+    subprocess.run([
+        acme, '--issue', '--dns', 'dns_gd',
+        '-d', domain, '-d', f'*.{domain}',
+        '--server', 'letsencrypt',
+    ], env=env, check=True)
+
+    cert = '/etc/nginx/jtunnel-wildcard.crt'
+    key  = '/etc/nginx/jtunnel-wildcard.key'
+    subprocess.run([
+        acme, '--install-cert', '-d', domain,
+        '--cert-file',  cert,
+        '--key-file',   key,
+        '--reloadcmd',  'nginx -s reload',
+    ], check=True)
+    os.chmod(key, 0o600)
+    print(f"  Wildcard cert installed — *.{domain} is fully trusted.\n")
+    return cert, key
+
+
+def _setup_nginx(cfg, domain, ip, gd_key=None, gd_secret=None):
+    """Install Nginx, configure reverse proxy. Cert mode: wildcard DNS-01 or per-tunnel HTTP-01."""
     print("  Installing Nginx + certbot...")
     subprocess.run(['apt-get','update','-qq'], check=True)
-    subprocess.run(['apt-get','install','-y','-qq','nginx','certbot'], check=True)
+    subprocess.run(['apt-get','install','-y','-qq','nginx','certbot','curl'], check=True)
     os.makedirs('/var/www/html', exist_ok=True)
 
     cfg['port'] = '8080'  # relay listens on 8080, nginx proxies from 443
     if domain:
         cfg['domain'] = domain
 
-    cert, key = '/etc/nginx/jtunnel.crt', '/etc/nginx/jtunnel.key'
+    server_name = domain or ip
 
-    if domain:
-        server_name = domain
-        cn          = f'*.{domain}'
-        san         = f'DNS:{domain},DNS:*.{domain}'
-        print(f"  Generating wildcard self-signed cert for *.{domain}...")
+    if domain and gd_key and gd_secret:
+        # DNS-01 wildcard — one cert covers everything, no per-tunnel issuance needed
+        cert, key = _setup_wildcard_cert(domain, gd_key, gd_secret)
+        cfg['wildcard'] = 'true'
     else:
-        server_name = ip
-        cn          = ip
-        san         = f'IP:{ip}'
-        print(f"  Generating self-signed cert for {ip}...")
-
-    subprocess.run([
-        'openssl','req','-x509','-newkey','rsa:4096',
-        '-keyout', key, '-out', cert, '-days', '365', '-nodes',
-        '-subj', f'/CN={cn}',
-        '-addext', f'subjectAltName={san}',
-    ], check=True, capture_output=True)
-    os.chmod(key, 0o600)
-    print(f"  Cert generated.\n")
+        # HTTP-01 — self-signed wildcard fallback, per-tunnel certs issued on connect
+        cert, key = '/etc/nginx/jtunnel.crt', '/etc/nginx/jtunnel.key'
+        cn  = f'*.{domain}' if domain else ip
+        san = f'DNS:{domain},DNS:*.{domain}' if domain else f'IP:{ip}'
+        print(f"  Generating self-signed fallback cert...")
+        subprocess.run([
+            'openssl','req','-x509','-newkey','rsa:4096',
+            '-keyout', key, '-out', cert, '-days', '365', '-nodes',
+            '-subj', f'/CN={cn}', '-addext', f'subjectAltName={san}',
+        ], check=True, capture_output=True)
+        os.chmod(key, 0o600)
+        print(f"  Self-signed cert generated.\n")
 
     ssl_block = f"""
     ssl_certificate     {cert};
@@ -206,8 +238,8 @@ server {{
     os.system("rm -f /etc/nginx/sites-enabled/default")
     os.system("nginx -t && systemctl enable nginx && systemctl restart nginx")
 
-    if domain:
-        # Get a real cert for the base domain via HTTP-01
+    if domain and not (gd_key and gd_secret):
+        # HTTP-01 mode: get a real cert for the base domain
         print(f"  Requesting Let's Encrypt cert for {domain}...")
         ret = os.system(
             f"certbot certonly --webroot -w /var/www/html -d {domain} "
@@ -396,8 +428,8 @@ async def tunnel_endpoint(request):
     public_url = f"https://{tunnel_id}.{domain}" if domain else f"https://{host}"
     await ws.send_str(json.dumps({'type': 'welcome', 'url': public_url, 'tunnel_id': tunnel_id}))
 
-    # Issue a real cert for this tunnel in the background
-    if domain and _SAFE_ID.match(tunnel_id):
+    # Issue per-tunnel cert only in HTTP-01 mode (wildcard mode already covers all subdomains)
+    if domain and cfg.get('wildcard') != 'true' and _SAFE_ID.match(tunnel_id):
         asyncio.create_task(_issue_cert(tunnel_id, domain))
 
     try:
@@ -548,15 +580,18 @@ async def start(cfg, cloud=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--setup',  action='store_true', help='First-time VPS setup')
-    ap.add_argument('--nginx',  action='store_true', help='Install Nginx as SSL reverse proxy')
-    ap.add_argument('--domain', help='Domain for Let\'s Encrypt cert (used with --nginx)')
-    ap.add_argument('--cloud',  action='store_true', help='Cloud mode (no SSL, reads PORT from env)')
-    ap.add_argument('--token',  help='Secret token')
+    ap.add_argument('--setup',      action='store_true', help='First-time VPS setup')
+    ap.add_argument('--nginx',      action='store_true', help='Install Nginx as SSL reverse proxy')
+    ap.add_argument('--domain',     help='Domain (used with --nginx)')
+    ap.add_argument('--gd-key',     help='GoDaddy API key  → wildcard cert via DNS-01 (optional)')
+    ap.add_argument('--gd-secret',  help='GoDaddy API secret')
+    ap.add_argument('--cloud',      action='store_true', help='Cloud mode (no SSL, reads PORT from env)')
+    ap.add_argument('--token',      help='Secret token')
     args = ap.parse_args()
 
     if args.setup:
-        do_setup(args.token, use_nginx=args.nginx, domain=args.domain)
+        do_setup(args.token, use_nginx=args.nginx, domain=args.domain,
+                 gd_key=args.gd_key, gd_secret=args.gd_secret)
         return
 
     cfg = load_config()
