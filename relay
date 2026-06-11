@@ -376,6 +376,28 @@ def _cleanup_tunnel(tunnel_id, domain, named):
     print(f'[x] Tunnel removed: {tunnel_id}')
 
 
+def _startup_cleanup(cfg):
+    """On startup: remove any nginx tunnel confs whose cert files are missing."""
+    import glob
+    removed = 0
+    for conf in glob.glob('/etc/nginx/sites-enabled/jtunnel-*'):
+        try:
+            cert = next((l.split()[1].rstrip(';') for l in open(conf)
+                         if 'ssl_certificate ' in l and 'key' not in l), None)
+            if cert and not os.path.exists(cert):
+                os.remove(conf)
+                avail = conf.replace('sites-enabled', 'sites-available')
+                if os.path.exists(avail):
+                    os.remove(avail)
+                removed += 1
+                print(f'[~] Removed stale nginx conf: {os.path.basename(conf)}')
+        except Exception:
+            pass
+    if removed:
+        os.system('nginx -s reload 2>/dev/null')
+        print(f'[~] Cleaned {removed} stale nginx conf(s) on startup')
+
+
 async def _cert_cleanup_loop(cfg):
     """Hourly: delete certs for tunnels idle > 1 day (random) or > 7 days (named)."""
     while True:
@@ -574,6 +596,7 @@ async def start(cfg, cloud=False):
         print(f"[+] JTunnel relay running (VPS mode) on port {port}")
 
     await site.start()
+    _startup_cleanup(cfg)
     asyncio.create_task(_cert_cleanup_loop(cfg))
     print(f"[+] Waiting for jtunnel client...")
     await asyncio.Event().wait()
