@@ -7,20 +7,25 @@ Built to work inside corporate networks that block all outbound ports except 443
 
 ## Architecture
 
-```
-  YOUR LAPTOP                        EC2 / VPS                        INTERNET
-  ──────────                         ─────────                        ────────
+```mermaid
+flowchart LR
+    subgraph Laptop["Your Laptop"]
+        CLIENT["jtunnel client"]
+        LOCAL["localhost:3000"]
+    end
 
-  jtunnel client  ══ WSS :443 ══▶  Nginx (port 443)
-  (your terminal)                      │  SSL termination
-                                       │  SNI routing
-                                       ▼
-                                   relay (port 8080)
-                                       │
-                                  _tunnels dict
-                               {tunnel-id: websocket}
-                                       │
-  localhost:3000  ◀── forward ────────┘◀─── HTTP request ──── Browser / curl
+    subgraph VPS["EC2 / VPS"]
+        NGINX["Nginx :443\nSSL termination\nSNI routing"]
+        RELAY["relay :8080\n_tunnels dict"]
+    end
+
+    BROWSER["Browser / curl"]
+
+    CLIENT -->|"WSS :443"| NGINX
+    NGINX --> RELAY
+    RELAY <-->|"tunnel-id → websocket"| CLIENT
+    CLIENT <--> LOCAL
+    BROWSER -->|"HTTPS"| NGINX
 ```
 
 ### Request flow
@@ -168,6 +173,14 @@ curl https://jtunnel.yourdomain.com/_health
 See [docs/architecture.md](docs/architecture.md) for a full technical walkthrough — request flow, SSL design, cert lifecycle, and multi-tunnel routing.
 
 ---
+
+## Environment reference (relay)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOKEN` | (from `~/.relayrc`) | Auth token; required in cloud mode |
+| `PORT` | `443` (VPS) / platform-assigned (cloud) | Port to listen on |
+| `DOMAIN` | (from `~/.relayrc`) | Domain for per-tunnel Let's Encrypt certs |
 
 ## Config files
 
